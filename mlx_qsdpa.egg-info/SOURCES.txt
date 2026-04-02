@@ -1,0 +1,11 @@
+pyproject.toml
+mlx_qsdpa/__init__.py
+mlx_qsdpa/bench.py
+mlx_qsdpa/dispatch.py
+mlx_qsdpa/kernels.py
+mlx_qsdpa.egg-info/PKG-INFO
+mlx_qsdpa.egg-info/SOURCES.txt
+mlx_qsdpa.egg-info/dependency_links.txt
+mlx_qsdpa.egg-info/requires.txt
+mlx_qsdpa.egg-info/top_level.txt
+tests/test_correctness.py

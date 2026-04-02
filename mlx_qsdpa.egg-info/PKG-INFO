@@ -1,0 +1,10 @@
+Metadata-Version: 2.4
+Name: mlx-qsdpa
+Version: 0.1.0
+Summary: Quantized SDPA decode kernel for MLX on Apple Silicon
+Requires-Python: >=3.10
+Requires-Dist: mlx>=0.21.0
+Provides-Extra: dev
+Requires-Dist: pytest; extra == "dev"
+Provides-Extra: bench
+Requires-Dist: mlx-lm>=0.20.0; extra == "bench"
