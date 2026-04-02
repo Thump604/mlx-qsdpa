@@ -4,14 +4,17 @@ Quantized SDPA decode kernel for MLX on Apple Silicon.
 
 ## What it does
 
-`mlx-qsdpa` provides a drop-in replacement for `mx.fast.scaled_dot_product_attention` that reads
-4-bit or 8-bit quantized K/V cache tensors and dequantizes inline in the Metal kernel. No FP16
-K/V buffer is ever materialized during decode. At 1M context, 4-bit KV reads are 6 GB vs 24 GB for
-FP16, reducing decode memory bandwidth by 4x and making long-context generation practical on
-128 GB Apple Silicon hardware.
+`mlx-qsdpa` provides a fused quantized attention kernel that reads 4-bit or 8-bit KV cache tensors
+and dequantizes inline in a single Metal dispatch. No intermediate FP16 buffer is ever materialized
+during decode. This is 1.7x faster than mlx-lm's two-call quantized path (`mx.quantized_matmul` x2
+\+ softmax) at 128K context with GQA, and reduces KV cache memory by 4x (6 GB vs 24 GB at 1M
+context on Qwen3.5-122B).
 
-The package is a pure function with no monkey-patching. It accepts packed integers and per-group
-scales/biases from `mx.quantize` directly and returns a standard float16 attention output tensor.
+The package includes:
+
+- **`quantized_sdpa`** -- fused decode kernel (single-pass and split-K two-pass)
+- **`QuantizedSDPACache`** -- quantized KV cache following mlx-lm's `_BaseCache` protocol
+- **`cache_sdpa`** -- dynamic dispatch: FP16 SDPA below 16K, fused kernel above
 
 ## Install
 
@@ -31,235 +34,214 @@ Requires Python >= 3.10 and mlx >= 0.21.0. No other dependencies.
 
 ## Quick Start
 
+### Low-level kernel
+
 ```python
 import mlx.core as mx
 from mlx_qsdpa import quantized_sdpa
 
-# Assume k_fp16, v_fp16 are your key/value tensors before quantization
-# Shape: (B, H_kv, N, D) float16
+# Quantize your K/V tensors
 packed_k, k_scales, k_biases = mx.quantize(k_fp16, group_size=32, bits=4)
 packed_v, v_scales, v_biases = mx.quantize(v_fp16, group_size=32, bits=4)
 
-# Query tensor for decode step (qL=1)
-# Shape: (B, H_q, 1, D) float16
-q = mx.random.normal((1, 16, 1, 256)).astype(mx.float16)
-
-# Quantized attention -- no FP16 K/V materialized
+# Decode attention -- no FP16 K/V materialized
+q = mx.random.normal((1, 32, 1, 256)).astype(mx.float16)
 out = quantized_sdpa(
-    q,
-    packed_k, packed_v,
-    k_scales, v_scales,
-    k_biases, v_biases,
-    bits=4,
-    group_size=32,
+    q, packed_k, packed_v, k_scales, v_scales, k_biases, v_biases,
+    bits=4, group_size=32,
 )
-# out: (1, 16, 1, 256) float16
-
-mx.eval(out)
 ```
 
-For symmetric quantization (no biases), omit `k_biases` and `v_biases`:
+### Cache + dynamic dispatch (recommended)
 
 ```python
-out = quantized_sdpa(q, packed_k, packed_v, k_scales, v_scales, bits=4)
-```
+from mlx_qsdpa import QuantizedSDPACache, cache_sdpa
 
-For prefill (qL > 1), the function automatically dequantizes and delegates to
-`mx.fast.scaled_dot_product_attention`. No special handling required.
+cache = QuantizedSDPACache(bits=4, group_size=32)
+
+# Prefill
+k_quant, v_quant = cache.update_and_fetch(keys, values)
+
+# Decode with dynamic dispatch:
+#   N < 16K  -> dequant + FP16 SDPA (faster at short context)
+#   N >= 16K -> fused quantized kernel (1.7x faster at long context)
+out = cache_sdpa(q, k_quant, v_quant, cache)
+```
 
 ## Performance
 
-Measured on M2 Ultra 128 GB with Qwen3.5-122B dimensions: B=1, H_q=16, H_kv=2, D=256 (GQA factor
-8). Kernel-only latency, 100 iterations after warmup.
+### Fused kernel vs mlx-lm's quantized path
 
-| Context | FP16 (ms) | 4-bit qSDPA (ms) | 4-bit vs FP16 |
-|---------|-----------|-------------------|---------------|
-| 1K      | 0.21      | 0.25              | 0.83x         |
-| 4K      | 0.24      | 0.29              | 0.81x         |
-| 8K      | 0.27      | 0.36              | 0.76x         |
-| 32K     | 0.43      | 0.56              | 0.72x         |
-| 131K    | 0.99      | 1.41              | 0.70x         |
+Measured on M2 Ultra 128 GB. B=1, D=256, 4-bit gs=32. Median of 100 iterations after warmup.
 
-With GQA 8x (Qwen3.5), the quantized kernel is 0.70-0.83x FP16. The overhead is compute-bound:
-8 query heads each do independent dequant+FMA against shared K/V data. L1 cache already handles
-the memory sharing efficiently.
+**GQA-16x (production config: H_q=32, H_kv=2, Qwen3.5-122B):**
 
-**Without GQA (H_q == H_kv), quantized SDPA matches FP16 at 0.98x.** The GQA overhead is the
-dominant factor, not the dequant itself.
+| Context | FP16 (us) | quantized_matmul (us) | fused (us) | fused vs qmm | fused vs FP16 |
+|---------|-----------|----------------------|------------|--------------|---------------|
+| 1K      | 234       | 312                  | 301        | 1.04x        | 0.78x         |
+| 4K      | 264       | 392                  | 512        | 0.77x        | 0.52x         |
+| 16K     | 427       | 902                  | 588        | **1.53x**    | 0.73x         |
+| 32K     | 568       | 1303                 | 882        | **1.48x**    | 0.64x         |
+| 64K     | 920       | 2244                 | 1438       | **1.56x**    | 0.64x         |
+| 128K    | 1478      | 4161                 | 2431       | **1.71x**    | 0.61x         |
 
-The primary value is not raw token/s on current hardware but **memory reduction**. At 1M context:
+The fused kernel eliminates the tensor reshapes and intermediate materialization that the two-call
+path requires for GQA. The advantage grows with sequence length: 1.71x at 128K.
 
-| Format | KV size (122B, 12 attn layers) | Headroom on 128 GB |
-|--------|---------------------------------|---------------------|
-| FP16   | ~24 GB                          | ~22 GB after weights |
-| 4-bit  | ~6 GB                           | ~40 GB after weights |
-| 8-bit  | ~12 GB                          | ~34 GB after weights |
+**Non-GQA (H_q=2, H_kv=2, isolates kernel fusion from GQA handling):**
 
-This makes 1M+ context viable on 128 GB hardware. The 122B model uses ~82 GB for weights, leaving
-46 GB. 4-bit KV at 1M consumes 6 GB; FP16 would consume 24 GB and exhaust the budget.
+| Context | FP16 (us) | quantized_matmul (us) | fused (us) | fused vs qmm | fused vs FP16 |
+|---------|-----------|----------------------|------------|--------------|---------------|
+| 1K      | 221       | 241                  | 294        | 0.82x        | 0.75x         |
+| 16K     | 249       | 277                  | 271        | **1.02x**    | 0.92x         |
+| 64K     | 397       | 377                  | 340        | **1.11x**    | 1.17x         |
+| 128K    | 587       | 542                  | 458        | **1.18x**    | **1.28x**     |
 
-Without GQA (H_q == H_kv), the quantized kernel matches FP16 at 0.98x due to more balanced work
-distribution across SIMDgroups.
+Without GQA, the fused kernel also beats FP16 at 64K+ due to 4x less memory bandwidth. The
+crossover happens at ~16K where the split-K two-pass kernel activates.
+
+### Why the 4K dip?
+
+The fused kernel transitions from single-pass (one threadgroup per query head) to split-K two-pass
+at N=4096. At exactly 4096, the single-pass kernel has only B\*H_q threadgroups, which cannot
+saturate the GPU. Above 4096, the split-K kernel distributes work across hundreds of blocks. This
+is a tiling discontinuity, not a fundamental limitation.
+
+### Dynamic dispatch crossover
+
+`cache_sdpa` uses FP16 SDPA below 16K (where it is faster) and the fused kernel at 16K+ (where
+memory bandwidth savings dominate). This gives best performance at all context lengths.
+
+### Memory savings
+
+The primary value at shorter contexts is not speed but memory reduction:
+
+| Format | KV size at 1M (122B, 12 attn layers) | Headroom on 128 GB |
+|--------|--------------------------------------|--------------------|
+| FP16   | ~24 GB                               | ~22 GB after weights |
+| 4-bit  | ~6 GB                                | ~40 GB after weights |
+
+This makes 1M+ context viable on 128 GB hardware.
 
 ## API Reference
 
+### `quantized_sdpa`
+
 ```python
 mlx_qsdpa.quantized_sdpa(
-    q,
-    packed_k,
-    packed_v,
-    k_scales,
-    v_scales,
-    k_biases=None,
-    v_biases=None,
-    scale=None,
-    mask=None,
-    bits=4,
-    group_size=32,
-    threshold=4096,
+    q, packed_k, packed_v, k_scales, v_scales,
+    k_biases=None, v_biases=None,
+    scale=None, mask=None, bits=4, group_size=32, threshold=4096,
 )
 ```
 
+Low-level fused attention kernel. For decode (qL=1), runs the Metal kernel directly. For prefill
+(qL>1), dequantizes and delegates to `mx.fast.scaled_dot_product_attention`.
+
 **Parameters:**
 
-- `q` -- `(B, H_q, qL, D)` float16 or bfloat16. Query tensor. For decode, qL must be 1.
-  For prefill (qL > 1), the function dequantizes K/V and delegates to standard SDPA.
+- `q` -- `(B, H_q, qL, D)` float16/bfloat16
+- `packed_k`, `packed_v` -- `(B, H_kv, N, D // (32 // bits))` uint32 from `mx.quantize`
+- `k_scales`, `v_scales` -- `(B, H_kv, N, D // group_size)` float16
+- `k_biases`, `v_biases` -- same shape as scales, or None for symmetric
+- `scale` -- float, default `D ** -0.5`
+- `bits` -- 4 or 8
+- `group_size` -- 32, 64, or 128
+- `threshold` -- split-K activation threshold (default 4096)
 
-- `packed_k` -- `(B, H_kv, N, D // (32 // bits))` uint32. Quantized keys from `mx.quantize`.
+**Returns:** `(B, H_q, qL, D)` in same dtype as `q`.
 
-- `packed_v` -- `(B, H_kv, N, D // (32 // bits))` uint32. Quantized values from `mx.quantize`.
+### `QuantizedSDPACache`
 
-- `k_scales` -- `(B, H_kv, N, D // group_size)` float16. Per-group scale factors for keys.
+```python
+mlx_qsdpa.QuantizedSDPACache(bits=4, group_size=32, step=256)
+```
 
-- `v_scales` -- `(B, H_kv, N, D // group_size)` float16. Per-group scale factors for values.
+Quantized KV cache following mlx-lm's `_BaseCache` protocol. Stores K/V in `mx.quantize` format
+with pre-allocated buffers.
 
-- `k_biases` -- `(B, H_kv, N, D // group_size)` float16, optional. Per-group biases for keys.
-  Pass `None` for symmetric quantization (faster; no bias buffer read).
+**`update_and_fetch(keys, values)`** -- Quantizes and appends K/V to the cache. Returns
+`(keys_quant, values_quant)` where each is a tuple of `(packed_uint32, scales_fp16, biases_fp16)`.
+This differs from mlx-lm's KVCache which returns plain float16 tensors.
 
-- `v_biases` -- `(B, H_kv, N, D // group_size)` float16, optional. Per-group biases for values.
+Protocol methods: `offset`, `bits`, `group_size`, `empty()`, `nbytes`, `is_trimmable()`, `trim()`,
+`rewind()`, `make_mask()`, `state`/`meta_state`, `from_state()`.
 
-- `scale` -- float, optional. Attention scale. Default: `D ** -0.5`.
+### `cache_sdpa`
 
-- `mask` -- not yet supported. Reserved for future use.
+```python
+mlx_qsdpa.cache_sdpa(
+    q, k_quant, v_quant, cache, scale=None, mask=None, crossover=16384,
+)
+```
 
-- `bits` -- int. Quantization bits. Must be 4 or 8.
+Dynamic dispatch attention. Below `crossover`, dequantizes and uses FP16 SDPA. At or above
+`crossover`, uses the fused quantized kernel. Prefill (qL>1) always dequantizes.
 
-- `group_size` -- int. Elements per quantization group. Must be 32, 64, or 128. Default: 32.
+**Parameters:**
 
-- `threshold` -- int. Sequence length above which the two-pass split-K kernel is used instead of
-  the single-pass kernel. Default: 4096. Tunable for your hardware.
-
-**Returns:** `(B, H_q, 1, D)` tensor in the same dtype as `q`.
-
-**Raises:**
-- `ValueError` if `q.ndim != 4`
-- `ValueError` if `bits` is not 4 or 8
-- `ValueError` if `D % 32 != 0`
-- `ValueError` if `H_q % H_kv != 0`
-- `ValueError` if `packed_k` last dim does not match `D // (32 // bits)`
+- `q` -- `(B, H_q, qL, D)` float16
+- `k_quant`, `v_quant` -- quantized tuples from `QuantizedSDPACache.update_and_fetch`
+- `cache` -- `QuantizedSDPACache` instance
+- `crossover` -- sequence length threshold (default 16384)
 
 ## Supported Formats
 
-The quantization format matches `mx.quantize` / `mx.dequantize` exactly. No conversion needed.
+Matches `mx.quantize` / `mx.dequantize` exactly. No conversion needed.
 
-| Format | bits | has_zeros | group_size | Notes |
-|--------|------|-----------|------------|-------|
-| 4-bit symmetric | 4 | no | 32 / 64 / 128 | Fastest. No bias buffer read. |
-| 4-bit asymmetric | 4 | yes | 32 / 64 / 128 | Matches mlx-lm QuantizedLinear default. |
-| 8-bit symmetric | 8 | no | 32 / 64 / 128 | |
+| Format | bits | biases | group_size | Notes |
+|--------|------|--------|------------|-------|
+| 4-bit asymmetric | 4 | yes | 32 / 64 / 128 | Default. Matches mlx-lm QuantizedLinear. |
+| 4-bit symmetric | 4 | no | 32 / 64 / 128 | Faster (no bias read). |
 | 8-bit asymmetric | 8 | yes | 32 / 64 / 128 | |
-
-Dequantization formula (matches `mx.dequantize`):
-
-```
-value = scale * packed_int + bias   # asymmetric
-value = scale * packed_int          # symmetric (bias == 0)
-```
-
-Bit unpacking from uint32:
-
-```
-element_i = (packed >> (i * bits)) & ((1 << bits) - 1)
-```
-
-Group size 32 is recommended. One SIMDgroup (32 threads) processes exactly one quantization group
-in a single coalesced read, minimizing register pressure.
+| 8-bit symmetric | 8 | no | 32 / 64 / 128 | |
 
 ## How It Works
 
-Two Metal kernels share one inner loop, compiled via `mx.fast.metal_kernel()`.
+Two Metal kernels compiled via `mx.fast.metal_kernel()`:
 
-**Single-pass kernel** (`N <= threshold`): One threadgroup per (batch, query head). 32 SIMDgroups
-stride through the key sequence. Each SIMDgroup loads a uint32-packed key, extracts elements by
-bit shift, applies scale and bias, computes a dot product with the pre-loaded query via `simd_sum`,
-and updates online softmax state (max + sum). Value accumulation follows the same dequant path.
-A cross-SIMDgroup reduction via threadgroup memory merges the 32 partial outputs into the final
-result.
+**Single-pass** (N <= threshold): One threadgroup per (batch, query head). 32 SIMDgroups stride
+through keys. Each loads a uint32-packed key, extracts elements by bit shift, applies scale/bias,
+computes a dot product via `simd_sum`, and updates online softmax state. Cross-SIMDgroup reduction
+merges 32 partial outputs.
 
-**Two-pass split-K kernel** (`N > threshold`): Pass 1 distributes the key sequence across up to
-1024 blocks in parallel. Each block computes partial attention (partial sum, logsumexp stats) over
-its slice. Pass 2 merges the blocks using logsumexp-weighted averaging with a second reduction pass.
-This avoids GPU watchdog timeouts at 128K+ context and keeps latency linear in N.
-
-The dequant inner loop is fully inlined (not a helper function call). This allows the Metal
-compiler to hoist scale/bias loads, unroll the bit-extract loop, and issue half-precision FMA
-instructions at full throughput.
+**Two-pass split-K** (N > threshold): Pass 1 distributes the key sequence across up to 1024 blocks.
+Each block computes partial attention with logsumexp stats. Pass 2 merges blocks using
+logsumexp-weighted averaging. Keeps latency linear in N at 128K+.
 
 ## Benchmarks
 
-Run the included benchmark script to measure kernel latency and effective bandwidth on your
-hardware:
-
 ```bash
-# Single config
-python -m mlx_qsdpa.bench --bits 4 --context 131072 --q-heads 16 --kv-heads 2 --head-dim 256
+# Three-way comparison: FP16 vs quantized_matmul vs fused
+python -m mlx_qsdpa.bench_comparison --headline-only
+python -m mlx_qsdpa.bench_comparison --decode-only --seq-len 16384,65536 --heads 32,2
+python -m mlx_qsdpa.bench_comparison --json --output results.jsonl
 
-# Full sweep across context lengths and bit widths
+# Single kernel benchmark (original)
 python -m mlx_qsdpa.bench --sweep
-
-# All options
-python -m mlx_qsdpa.bench --help
 ```
 
-Output includes FP16 baseline latency, quantized latency, speedup ratio, and effective memory
-bandwidth for both paths.
-
-Run the test suite (28 tests):
+Tests (59 tests):
 
 ```bash
 pip install mlx-qsdpa[dev]
 pytest tests/
-pytest tests/ -m "not slow"   # skip long-context tests
 ```
 
 ## Limitations
 
-**GQA compute overhead.** When H_q >> H_kv (e.g., 8x GQA), KV data volume is small relative to
-query computation. The quantized kernel does not recover the overhead of the two-pass split-K
-reduction at high context lengths when KV is narrow. At 131K context with 8x GQA, throughput is
-0.70x FP16. At no-GQA ratios the overhead disappears (0.98x). This is a known architectural
-limitation of the current kernel design.
+**GQA compute overhead.** With GQA, the fused kernel is 0.52-0.78x FP16 speed (but 1.5-1.7x faster
+than the existing quantized path). The overhead is compute-bound: multiple query heads each do
+independent dequant+FMA against shared K/V. Without GQA, fused matches or beats FP16 at 64K+.
 
-**mx.fast.metal_kernel ceiling.** The kernels are written in MSL via `mx.fast.metal_kernel()`.
-This is the correct path for rapid iteration but cannot beat a native C++ kernel registered in the
-MLX operation registry. Maximum possible throughput is bounded by what the Python-level dispatch
-overhead allows. A future upstream C++ kernel (mlx PR #3307 path) would eliminate that ceiling.
+**mx.fast.metal_kernel ceiling.** Kernels are written via `mx.fast.metal_kernel()`. This allows
+rapid iteration but cannot beat a native C++ kernel. A future upstream C++ kernel (mlx PR #3026
+path) would eliminate that ceiling.
 
-**Upstream C++ path not yet merged.** CC-Yeh's quantized SDPA work in mlx (PR #3026) would provide
-a native quantized path with lower dispatch overhead. This package is the interim solution while
-that PR is in review.
+**Prefill is not accelerated.** Prefill is compute-bound. For qL > 1, the function dequantizes
+and delegates to `mx.fast.scaled_dot_product_attention`.
 
-**Contiguous memory required.** `packed_k` and `packed_v` must be contiguous in memory.
-`ensure_row_contiguous=True` is set on the kernel, so non-contiguous inputs trigger an implicit
-copy. The cache layer is responsible for producing contiguous tensors (or accepting the copy cost).
-
-**No 2-bit support.** 4-bit and 8-bit affine quantization only. 2-bit affine has poor quality for
-KV cache. Non-uniform codebooks (e.g., RaBitQ) are a different kernel architecture and are not in
-scope for this version.
-
-**Prefill is not accelerated.** Prefill is compute-bound, not memory-bandwidth-bound. For qL > 1,
-the function dequantizes K/V and calls the standard `mx.fast.scaled_dot_product_attention`. There
-is no benefit to running a quantized kernel during prefill.
+**No 2-bit support.** 4-bit and 8-bit affine only.
 
 ## License
 
