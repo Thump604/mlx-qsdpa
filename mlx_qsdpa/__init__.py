@@ -1,5 +1,10 @@
 from mlx_qsdpa.dispatch import quantized_sdpa
-from mlx_qsdpa.cache import QuantizedSDPACache
+from mlx_qsdpa.cache import (
+    QuantizedSDPACache,
+    BatchQuantizedSDPACache,
+    QuantizedRotatingSDPACache,
+    BatchQuantizedRotatingSDPACache,
+)
 
 import mlx.core as mx
 
@@ -27,7 +32,7 @@ def cache_sdpa(
         q:        (B, H_q, qL, D) float16 query
         k_quant:  (packed_uint32, scales_fp16, biases_fp16) from cache
         v_quant:  (packed_uint32, scales_fp16, biases_fp16) from cache
-        cache:    QuantizedSDPACache instance (provides bits, group_size)
+        cache:    QuantizedSDPACache or QuantizedRotatingSDPACache instance
         scale:    attention scale (default: 1/sqrt(D))
         mask:     attention mask (default: None)
         crossover: sequence length at which to switch from FP16 to fused.
@@ -63,4 +68,11 @@ def cache_sdpa(
     )
 
 
-__all__ = ["quantized_sdpa", "QuantizedSDPACache", "cache_sdpa"]
+__all__ = [
+    "quantized_sdpa",
+    "QuantizedSDPACache",
+    "BatchQuantizedSDPACache",
+    "QuantizedRotatingSDPACache",
+    "BatchQuantizedRotatingSDPACache",
+    "cache_sdpa",
+]

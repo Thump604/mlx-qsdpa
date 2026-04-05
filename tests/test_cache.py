@@ -260,3 +260,29 @@ class TestCacheProtocol:
         values = mx.random.normal((B, H_kv, 10, D)).astype(mx.float16)
         cache.update_and_fetch(keys, values)
         assert cache.nbytes > 0
+
+    def test_merge_builds_batch_history_cache(self):
+        """History caches can be merged for continuous batching admission."""
+        from mlx_qsdpa.cache import BatchQuantizedSDPACache, QuantizedSDPACache
+
+        mx.random.seed(42)
+        cache_a = QuantizedSDPACache(bits=4, group_size=32)
+        cache_b = QuantizedSDPACache(bits=4, group_size=32)
+        B, H_kv, D = 1, 2, 256
+
+        keys_a = mx.random.normal((B, H_kv, 4, D)).astype(mx.float16)
+        values_a = mx.random.normal((B, H_kv, 4, D)).astype(mx.float16)
+        keys_b = mx.random.normal((B, H_kv, 2, D)).astype(mx.float16)
+        values_b = mx.random.normal((B, H_kv, 2, D)).astype(mx.float16)
+
+        cache_a.update_and_fetch(keys_a, values_a)
+        cache_b.update_and_fetch(keys_b, values_b)
+
+        batch = QuantizedSDPACache.merge([cache_a, cache_b])
+
+        assert isinstance(batch, BatchQuantizedSDPACache)
+        state = batch.state
+        assert state[2].shape[0] == 2
+        assert state[3].shape[0] == 2
+        assert batch.extract(0).offset == 4
+        assert batch.extract(1).offset == 2

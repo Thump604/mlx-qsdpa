@@ -14,6 +14,8 @@ The package includes:
 
 - **`quantized_sdpa`** -- fused decode kernel (single-pass and split-K two-pass)
 - **`QuantizedSDPACache`** -- quantized KV cache following mlx-lm's `_BaseCache` protocol
+- **`QuantizedRotatingSDPACache`** -- quantized circular-buffer KV cache for sliding-window layers
+- **`BatchQuantizedRotatingSDPACache`** -- batch-aware rotating cache for continuous batching
 - **`cache_sdpa`** -- dynamic dispatch: FP16 SDPA below 16K, fused kernel above
 
 ## Install
@@ -167,6 +169,27 @@ This differs from mlx-lm's KVCache which returns plain float16 tensors.
 Protocol methods: `offset`, `bits`, `group_size`, `empty()`, `nbytes`, `is_trimmable()`, `trim()`,
 `rewind()`, `make_mask()`, `state`/`meta_state`, `from_state()`.
 
+### `QuantizedRotatingSDPACache`
+
+```python
+mlx_qsdpa.QuantizedRotatingSDPACache(max_size=4096, keep=0, bits=4, group_size=32)
+```
+
+Quantized circular-buffer KV cache for sliding-window attention layers such as Gemma 4. Decode
+writes tokens in place; multi-token updates rebuild the visible window in temporal order and
+re-quantize it back into the bounded buffer.
+
+### `BatchQuantizedRotatingSDPACache`
+
+```python
+mlx_qsdpa.BatchQuantizedRotatingSDPACache(
+    left_padding=[0, 0], max_size=4096, keep=0, bits=4, group_size=32
+)
+```
+
+Batch-aware rotating cache for continuous batching. Supports filtering, extraction back to a
+single-request rotating cache, and merge from single rotating caches.
+
 ### `cache_sdpa`
 
 ```python
@@ -221,7 +244,7 @@ python -m mlx_qsdpa.bench_comparison --json --output results.jsonl
 python -m mlx_qsdpa.bench --sweep
 ```
 
-Tests (59 tests):
+Tests (87 tests):
 
 ```bash
 pip install mlx-qsdpa[dev]
