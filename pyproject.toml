@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mlx-qsdpa"
-version = "0.3.0"
+version = "0.3.1"
 description = "Quantized SDPA decode kernel for MLX on Apple Silicon"
 requires-python = ">=3.10"
 dependencies = ["mlx>=0.21.0"]
