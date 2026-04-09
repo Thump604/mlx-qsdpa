@@ -14,6 +14,7 @@ The package includes:
 
 - **`quantized_sdpa`** -- fused decode kernel (single-pass and split-K two-pass)
 - **`QuantizedSDPACache`** -- quantized KV cache following mlx-lm's `_BaseCache` protocol
+- **`BatchQuantizedSDPACache`** -- batch-aware quantized cache for continuous batching / prefix reuse
 - **`QuantizedRotatingSDPACache`** -- quantized circular-buffer KV cache for sliding-window layers
 - **`BatchQuantizedRotatingSDPACache`** -- batch-aware rotating cache for continuous batching
 - **`cache_sdpa`** -- dynamic dispatch: FP16 SDPA below 16K, fused kernel above
@@ -167,7 +168,20 @@ with pre-allocated buffers.
 This differs from mlx-lm's KVCache which returns plain float16 tensors.
 
 Protocol methods: `offset`, `bits`, `group_size`, `empty()`, `nbytes`, `is_trimmable()`, `trim()`,
-`rewind()`, `make_mask()`, `state`/`meta_state`, `from_state()`.
+`rewind()`, `make_mask()`, `state`/`meta_state`, `from_state()`, `merge()`.
+
+`merge([cache_a, cache_b, ...])` returns a `BatchQuantizedSDPACache` suitable for continuous
+batching or admitting cached history into a batched prefill path.
+
+### `BatchQuantizedSDPACache`
+
+```python
+mlx_qsdpa.BatchQuantizedSDPACache(left_padding=[0, 0], bits=4, group_size=32)
+```
+
+Batch-aware quantized KV cache. Mirrors mlx-lm's batch-cache protocol while storing K/V in
+quantized `(packed, scales, biases)` form. Supports `prepare()`, `finalize()`, `filter()`,
+`extend()`, `extract()`, left-padding-aware `make_mask()`, and `state` round-trips.
 
 ### `QuantizedRotatingSDPACache`
 
@@ -179,6 +193,9 @@ Quantized circular-buffer KV cache for sliding-window attention layers such as G
 writes tokens in place; multi-token updates rebuild the visible window in temporal order and
 re-quantize it back into the bounded buffer.
 
+Supports `make_mask()`, `trim()`, `rewind()`, and temporal-order `state` snapshots. Current
+limitation: `keep > 0` is not implemented yet.
+
 ### `BatchQuantizedRotatingSDPACache`
 
 ```python
@@ -188,7 +205,8 @@ mlx_qsdpa.BatchQuantizedRotatingSDPACache(
 ```
 
 Batch-aware rotating cache for continuous batching. Supports filtering, extraction back to a
-single-request rotating cache, and merge from single rotating caches.
+single-request rotating cache, merge from single rotating caches, and left-padding-aware masks for
+batched sliding-window attention.
 
 ### `cache_sdpa`
 
@@ -205,7 +223,9 @@ Dynamic dispatch attention. Below `crossover`, dequantizes and uses FP16 SDPA. A
 
 - `q` -- `(B, H_q, qL, D)` float16
 - `k_quant`, `v_quant` -- quantized tuples from `QuantizedSDPACache.update_and_fetch`
-- `cache` -- `QuantizedSDPACache` instance
+- `cache` -- any quantized cache carrying `bits` and `group_size`
+  (`QuantizedSDPACache`, `BatchQuantizedSDPACache`, `QuantizedRotatingSDPACache`,
+  `BatchQuantizedRotatingSDPACache`)
 - `crossover` -- sequence length threshold (default 16384)
 
 ## Supported Formats
@@ -250,6 +270,36 @@ Tests (87 tests):
 pip install mlx-qsdpa[dev]
 pytest tests/
 ```
+
+## ai-runtime Integration
+
+This repository also vendors `mlx-qsdpa` into `/opt/ai-runtime`. The integration below is runtime
+specific; it is **not** part of the standalone `pip install mlx-qsdpa` API.
+
+Runtime hooks live in `/opt/ai-runtime/lib/runtime_patches/__init__.py`:
+
+- **SDPA routing patch** -- monkey-patches `mlx_lm.models.base.scaled_dot_product_attention` to
+  detect quantized caches via the `_use_fused_sdpa` marker and route through `cache_sdpa`.
+- **KV-cache swap patch** -- when `mode.json` sets `kv_quantize: true`, replaces:
+  - `KVCache` -> `QuantizedSDPACache`
+  - `RotatingKVCache` -> `QuantizedRotatingSDPACache`
+  - batch cache creation paths -> `BatchQuantizedSDPACache` /
+    `BatchQuantizedRotatingSDPACache`
+- **Patched paths** -- the swap is applied in three places:
+  - `mlx_lm.models.cache.make_prompt_cache` (SimpleEngine)
+  - `mlx_lm.generate._make_cache` (BatchedEngine scheduler)
+  - `vllm_mlx.mllm_batch_generator._make_batch_cache` (MLLM batching)
+- **Runtime config knobs**:
+  - `kv_quantize_bits`: `4` or `8` (default `4`)
+  - `kv_quantize_group_size`: `32`, `64`, or `128` (default `32`)
+  - `kv_quantize_crossover`: dynamic dispatch threshold (default `16384`)
+  - `MLX_QSDPA_CROSSOVER`: env var override for the crossover without editing `mode.json`
+- **Layer filtering** -- only layers with supported KV head dimensions (`64`, `96`, `128`, `192`,
+  `256`) are quantized; unsupported layers stay on their original FP16 caches.
+
+The batch-cache methods documented above (`merge`, `prepare`, `finalize`, `filter`, `extract`,
+left-padding-aware `make_mask`) are what let the runtime admit prefix-cached history into
+continuous batching without dequantizing back to FP16.
 
 ## Limitations
 

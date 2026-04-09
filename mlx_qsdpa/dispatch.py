@@ -30,7 +30,7 @@ def quantized_sdpa(
         k_biases:  (B, H_kv, N, num_groups) float16 key biases, or None for symmetric
         v_biases:  (B, H_kv, N, num_groups) float16 value biases, or None for symmetric
         scale:     float, attention scale (default: 1/sqrt(D))
-        mask:      not yet supported (placeholder)
+        mask:      optional attention mask; falls back to FP16 SDPA when set
         bits:      quantization bits (4 or 8)
         group_size: elements per quantization group (32, 64, 128)
         threshold: N above which to use two-pass kernel (not yet implemented)
@@ -64,8 +64,8 @@ def quantized_sdpa(
     if H_q % H_kv != 0:
         raise ValueError(f"H_q ({H_q}) must be divisible by H_kv ({H_kv})")
 
-    # ---- prefill fallback: dequantize + standard SDPA ----
-    if qL > 1:
+    # ---- prefill / masked fallback: dequantize + standard SDPA ----
+    if qL > 1 or mask is not None:
         k_ref = mx.dequantize(
             packed_k, k_scales,
             k_biases if k_biases is not None else mx.zeros_like(k_scales),
@@ -78,7 +78,9 @@ def quantized_sdpa(
         )
         if scale is None:
             scale = D ** -0.5
-        return mx.fast.scaled_dot_product_attention(q, k_ref, v_ref, scale=scale)
+        return mx.fast.scaled_dot_product_attention(
+            q, k_ref, v_ref, scale=scale, mask=mask
+        )
 
     # ---- decode path (qL == 1) ----
     if scale is None:

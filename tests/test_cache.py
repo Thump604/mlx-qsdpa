@@ -286,3 +286,48 @@ class TestCacheProtocol:
         assert state[3].shape[0] == 2
         assert batch.extract(0).offset == 4
         assert batch.extract(1).offset == 2
+
+
+class TestBatchCacheProtocol:
+    def test_make_mask_respects_left_padding(self):
+        """Batched masks must hide left-padding positions per request."""
+        from mlx_qsdpa.cache import QuantizedSDPACache
+
+        mx.random.seed(42)
+        B, H_kv, D = 1, 2, 256
+
+        cache_a = QuantizedSDPACache(bits=4, group_size=32)
+        cache_b = QuantizedSDPACache(bits=4, group_size=32)
+
+        keys_a = mx.random.normal((B, H_kv, 4, D)).astype(mx.float16)
+        values_a = mx.random.normal((B, H_kv, 4, D)).astype(mx.float16)
+        keys_b = mx.random.normal((B, H_kv, 2, D)).astype(mx.float16)
+        values_b = mx.random.normal((B, H_kv, 2, D)).astype(mx.float16)
+
+        cache_a.update_and_fetch(keys_a, values_a)
+        cache_b.update_and_fetch(keys_b, values_b)
+
+        batch = QuantizedSDPACache.merge([cache_a, cache_b])
+        mask = batch.make_mask(2)
+
+        expected = mx.array(
+            [
+                [
+                    [
+                        [True, True, True, True, True, False],
+                        [True, True, True, True, True, True],
+                    ]
+                ],
+                [
+                    [
+                        [False, False, True, False, False, False],
+                        [False, False, True, True, False, False],
+                    ]
+                ],
+            ],
+            dtype=mx.bool_,
+        )
+
+        mx.eval(mask, expected)
+        assert mask.shape == (2, 1, 2, 6)
+        assert mx.array_equal(mask, expected).item()

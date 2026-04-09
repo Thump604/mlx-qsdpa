@@ -369,7 +369,10 @@ class BatchQuantizedSDPACache:
     def make_mask(self, N, return_array=False, **kwargs):
         """Causal mask with left-padding awareness."""
         return _create_causal_mask(
-            N, offset=self._idx, left_padding=self.left_padding
+            N,
+            offset=self.offset,
+            left_padding=self.left_padding,
+            window_size=kwargs.get("window_size"),
         )
 
     def filter(self, batch_indices):
@@ -855,8 +858,12 @@ class BatchQuantizedRotatingSDPACache:
 
     def make_mask(self, N, return_array=False, **kwargs):
         """Causal mask with left-padding awareness."""
-        effective = min(self._idx, self.max_size)
-        return _create_causal_mask(N, offset=effective, left_padding=self.left_padding)
+        return _create_causal_mask(
+            N,
+            offset=mx.minimum(self.offset, self.max_size),
+            left_padding=self.left_padding,
+            window_size=kwargs.get("window_size"),
+        )
 
     def filter(self, batch_indices):
         """Keep only the given batch indices."""
@@ -911,17 +918,31 @@ class BatchQuantizedRotatingSDPACache:
         )
         if self._keys is None:
             return cache
-        padding = self.left_padding[idx].item()
-        end = min(self._idx, self.max_size)
-        n_tokens = end - padding
-        cache._keys = tuple(
-            mx.contiguous(t[idx:idx + 1, :, padding:end])
-            for t in self._keys
-        )
-        cache._values = tuple(
-            mx.contiguous(t[idx:idx + 1, :, padding:end])
-            for t in self._values
-        )
+        visible = min(self._idx, self.max_size)
+        n_tokens = max(0, min(self.offset[idx].item(), self.max_size))
+        if n_tokens == 0:
+            return cache
+
+        def extract_temporal(tuples):
+            result = tuple(
+                mx.contiguous(t[idx:idx + 1, :, :visible, :]) for t in tuples
+            )
+            if self._idx > self.max_size:
+                write_pos = self._idx % self.max_size
+                if write_pos > 0:
+                    result = tuple(
+                        mx.concatenate(
+                            [t[..., write_pos:, :], t[..., :write_pos, :]], axis=2
+                        )
+                        for t in result
+                    )
+            padding = visible - n_tokens
+            if padding > 0:
+                result = tuple(mx.contiguous(t[..., padding:visible, :]) for t in result)
+            return result
+
+        cache._keys = extract_temporal(self._keys)
+        cache._values = extract_temporal(self._values)
         cache.offset = n_tokens
         cache._idx = n_tokens
         # Pad to max_size so subsequent decode writes stay in bounds

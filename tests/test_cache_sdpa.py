@@ -142,6 +142,36 @@ class TestDynamicDispatch:
         mx.eval(out)
         assert out.shape == (B, H_q, 1, D)
 
+    def test_long_context_with_mask_falls_back_to_fp16(self):
+        """Masked decode must preserve mask semantics even above crossover."""
+        from mlx_qsdpa import cache_sdpa
+        from mlx_qsdpa.cache import QuantizedSDPACache
+
+        mx.random.seed(42)
+        B, H_q, H_kv, N, D = 1, 2, 2, 64, 256
+        cache = QuantizedSDPACache(bits=4, group_size=32)
+
+        keys = mx.random.normal((B, H_kv, N, D)).astype(mx.float16)
+        values = mx.random.normal((B, H_kv, N, D)).astype(mx.float16)
+        k_quant, v_quant = cache.update_and_fetch(keys, values)
+
+        q = mx.random.normal((B, H_q, 1, D)).astype(mx.float16)
+        mask = (mx.arange(N) >= (N - 8))[None, None, None, :]
+
+        out = cache_sdpa(q, k_quant, v_quant, cache, crossover=0, mask=mask)
+
+        k_deq = mx.dequantize(k_quant[0], k_quant[1], k_quant[2],
+                              group_size=32, bits=4)
+        v_deq = mx.dequantize(v_quant[0], v_quant[1], v_quant[2],
+                              group_size=32, bits=4)
+        ref = mx.fast.scaled_dot_product_attention(
+            q, k_deq, v_deq, scale=D**-0.5, mask=mask
+        )
+
+        mx.eval(out, ref)
+        diff = mx.max(mx.abs(out - ref)).item()
+        assert diff < 1e-5, f"masked long-context diff {diff}"
+
 
 class TestCacheKernelIntegration:
     def test_decode_non_gqa(self):

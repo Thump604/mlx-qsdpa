@@ -70,6 +70,52 @@ class TestBatchFilter:
         assert cache._keys[0].shape[0] == 1
         assert cache.offset.shape[0] == 1
 
+    def test_make_mask_respects_left_padding(self):
+        from mlx_qsdpa.cache import (
+            BatchQuantizedRotatingSDPACache,
+            QuantizedRotatingSDPACache,
+        )
+
+        mx.random.seed(42)
+        B, H_kv, D = 1, 2, 64
+
+        cache_a = QuantizedRotatingSDPACache(max_size=16, bits=4, group_size=32)
+        cache_b = QuantizedRotatingSDPACache(max_size=16, bits=4, group_size=32)
+
+        for _ in range(4):
+            k = mx.random.normal((B, H_kv, 1, D)).astype(mx.float16)
+            v = mx.random.normal((B, H_kv, 1, D)).astype(mx.float16)
+            cache_a.update_and_fetch(k, v)
+        for _ in range(2):
+            k = mx.random.normal((B, H_kv, 1, D)).astype(mx.float16)
+            v = mx.random.normal((B, H_kv, 1, D)).astype(mx.float16)
+            cache_b.update_and_fetch(k, v)
+
+        batch = BatchQuantizedRotatingSDPACache.merge([cache_a, cache_b])
+        mask = batch.make_mask(2)
+
+        expected = mx.array(
+            [
+                [
+                    [
+                        [True, True, True, True, True, False],
+                        [True, True, True, True, True, True],
+                    ]
+                ],
+                [
+                    [
+                        [False, False, True, False, False, False],
+                        [False, False, True, True, False, False],
+                    ]
+                ],
+            ],
+            dtype=mx.bool_,
+        )
+
+        mx.eval(mask, expected)
+        assert mask.shape == (2, 1, 2, 6)
+        assert mx.array_equal(mask, expected).item()
+
 
 class TestBatchExtractAndMerge:
     def test_extract_single(self):
@@ -110,3 +156,26 @@ class TestBatchExtractAndMerge:
         assert isinstance(batch, BatchQuantizedRotatingSDPACache)
         assert batch._keys[0].shape[0] == 2
         assert batch.max_size == 16
+
+    def test_extract_preserves_temporal_order_after_wrap(self):
+        from mlx_qsdpa.cache import BatchQuantizedRotatingSDPACache
+
+        mx.random.seed(42)
+        cache = BatchQuantizedRotatingSDPACache(
+            [0], max_size=4, bits=4, group_size=32
+        )
+        all_keys = []
+
+        for _ in range(6):
+            k = mx.random.normal((1, 1, 1, 64)).astype(mx.float16)
+            v = mx.random.normal((1, 1, 1, 64)).astype(mx.float16)
+            all_keys.append(k)
+            cache.update_and_fetch(k, v)
+
+        extracted = cache.extract(0)
+        expected_keys = mx.concatenate(all_keys[-4:], axis=2)
+        expected_quant = mx.quantize(expected_keys, group_size=32, bits=4)
+
+        mx.eval(extracted.state[0][0], expected_quant[0])
+        assert extracted.offset == 4
+        assert mx.array_equal(extracted.state[0][0], expected_quant[0]).item()
