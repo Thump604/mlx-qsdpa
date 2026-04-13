@@ -271,35 +271,11 @@ pip install mlx-qsdpa[dev]
 pytest tests/
 ```
 
-## ai-runtime Integration
+## Downstream Integrations
 
-This repository also vendors `mlx-qsdpa` into `/opt/ai-runtime`. The integration below is runtime
-specific; it is **not** part of the standalone `pip install mlx-qsdpa` API.
-
-Runtime hooks live in `/opt/ai-runtime/lib/runtime_patches/__init__.py`:
-
-- **SDPA routing patch** -- monkey-patches `mlx_lm.models.base.scaled_dot_product_attention` to
-  detect quantized caches via the `_use_fused_sdpa` marker and route through `cache_sdpa`.
-- **KV-cache swap patch** -- when `mode.json` sets `kv_quantize: true`, replaces:
-  - `KVCache` -> `QuantizedSDPACache`
-  - `RotatingKVCache` -> `QuantizedRotatingSDPACache`
-  - batch cache creation paths -> `BatchQuantizedSDPACache` /
-    `BatchQuantizedRotatingSDPACache`
-- **Patched paths** -- the swap is applied in three places:
-  - `mlx_lm.models.cache.make_prompt_cache` (SimpleEngine)
-  - `mlx_lm.generate._make_cache` (BatchedEngine scheduler)
-  - `vllm_mlx.mllm_batch_generator._make_batch_cache` (MLLM batching)
-- **Runtime config knobs**:
-  - `kv_quantize_bits`: `4` or `8` (default `4`)
-  - `kv_quantize_group_size`: `32`, `64`, or `128` (default `32`)
-  - `kv_quantize_crossover`: dynamic dispatch threshold (default `16384`)
-  - `MLX_QSDPA_CROSSOVER`: env var override for the crossover without editing `mode.json`
-- **Layer filtering** -- only layers with supported KV head dimensions (`64`, `96`, `128`, `192`,
-  `256`) are quantized; unsupported layers stay on their original FP16 caches.
-
-The batch-cache methods documented above (`merge`, `prepare`, `finalize`, `filter`, `extract`,
-left-padding-aware `make_mask`) are what let the runtime admit prefix-cached history into
-continuous batching without dequantizing back to FP16.
+`mlx-qsdpa` is designed to be embedded by other runtimes and applications, but those integrations
+are downstream-specific and are not part of the standalone `pip install mlx-qsdpa` API described
+in this repository.
 
 ## Limitations
 
