@@ -104,8 +104,8 @@ class TestBatchFilter:
                 ],
                 [
                     [
-                        [False, False, True, False, False, False],
-                        [False, False, True, True, False, False],
+                        [False, False, True, True, True, False],
+                        [False, False, True, True, True, True],
                     ]
                 ],
             ],
@@ -115,6 +115,69 @@ class TestBatchFilter:
         mx.eval(mask, expected)
         assert mask.shape == (2, 1, 2, 6)
         assert mx.array_equal(mask, expected).item()
+
+    def test_make_mask_uses_visible_buffer_not_logical_offset(self):
+        from mlx_qsdpa.cache import BatchQuantizedRotatingSDPACache
+
+        cache = BatchQuantizedRotatingSDPACache(
+            [0], max_size=65536, bits=8, group_size=64
+        )
+        cache._idx = 89
+        cache.offset = mx.array([819])
+
+        mask = cache.make_mask(1)
+
+        mx.eval(mask)
+        assert mask.shape == (1, 1, 1, 90)
+
+    def test_make_mask_decode_matches_next_visible_token(self):
+        from mlx_qsdpa.cache import BatchQuantizedRotatingSDPACache
+
+        mx.random.seed(42)
+        cache = BatchQuantizedRotatingSDPACache(
+            [0], max_size=16, bits=4, group_size=32
+        )
+        B, H_kv, D = 1, 2, 64
+
+        for _ in range(5):
+            k = mx.random.normal((B, H_kv, 1, D)).astype(mx.float16)
+            v = mx.random.normal((B, H_kv, 1, D)).astype(mx.float16)
+            cache.update_and_fetch(k, v)
+
+        mask = cache.make_mask(1)
+        k = mx.random.normal((B, H_kv, 1, D)).astype(mx.float16)
+        v = mx.random.normal((B, H_kv, 1, D)).astype(mx.float16)
+        keys, _ = cache.update_and_fetch(k, v)
+
+        mx.eval(mask, keys[0])
+        assert mask.shape[-1] == keys[0].shape[2]
+
+    def test_decode_grows_compact_merged_buffer(self):
+        from mlx_qsdpa.cache import (
+            BatchQuantizedRotatingSDPACache,
+            QuantizedRotatingSDPACache,
+        )
+
+        mx.random.seed(42)
+        B, H_kv, D = 1, 2, 64
+        single = QuantizedRotatingSDPACache(max_size=16, bits=4, group_size=32)
+
+        for _ in range(5):
+            k = mx.random.normal((B, H_kv, 1, D)).astype(mx.float16)
+            v = mx.random.normal((B, H_kv, 1, D)).astype(mx.float16)
+            single.update_and_fetch(k, v)
+
+        batch = BatchQuantizedRotatingSDPACache.merge([single])
+        assert batch._keys[0].shape[2] == 5
+
+        mask = batch.make_mask(1)
+        k = mx.random.normal((B, H_kv, 1, D)).astype(mx.float16)
+        v = mx.random.normal((B, H_kv, 1, D)).astype(mx.float16)
+        keys, _ = batch.update_and_fetch(k, v)
+
+        mx.eval(mask, keys[0])
+        assert keys[0].shape[2] == 6
+        assert mask.shape[-1] == 6
 
 
 class TestBatchExtractAndMerge:
@@ -153,6 +216,28 @@ class TestBatchExtractAndMerge:
                 c.update_and_fetch(k, v)
             caches.append(c)
         batch = BatchQuantizedRotatingSDPACache.merge(caches)
+        assert isinstance(batch, BatchQuantizedRotatingSDPACache)
+        assert batch._keys[0].shape[0] == 2
+        assert batch.max_size == 16
+
+    def test_single_cache_merge_delegates_to_batch_merge(self):
+        from mlx_qsdpa.cache import (
+            BatchQuantizedRotatingSDPACache,
+            QuantizedRotatingSDPACache,
+        )
+
+        mx.random.seed(42)
+        B, H_kv, D = 1, 2, 64
+        caches = []
+        for length in [2, 4]:
+            cache = QuantizedRotatingSDPACache(max_size=16, bits=4, group_size=32)
+            for _ in range(length):
+                k = mx.random.normal((B, H_kv, 1, D)).astype(mx.float16)
+                v = mx.random.normal((B, H_kv, 1, D)).astype(mx.float16)
+                cache.update_and_fetch(k, v)
+            caches.append(cache)
+
+        batch = caches[0].merge(caches)
         assert isinstance(batch, BatchQuantizedRotatingSDPACache)
         assert batch._keys[0].shape[0] == 2
         assert batch.max_size == 16
