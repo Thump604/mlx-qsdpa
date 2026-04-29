@@ -710,6 +710,11 @@ class QuantizedRotatingSDPACache:
         self._keys = expand(keys)
         self._values = expand(values)
 
+    @classmethod
+    def merge(cls, caches):
+        """Merge single-request rotating caches into a batch-aware cache."""
+        return BatchQuantizedRotatingSDPACache.merge(caches)
+
 
 class BatchQuantizedRotatingSDPACache:
     """Batch-aware quantized rotating KV cache for sliding-window attention.
@@ -727,6 +732,7 @@ class BatchQuantizedRotatingSDPACache:
     """
 
     _use_fused_sdpa = True
+    step = 256
 
     def __init__(self, left_padding, max_size, keep=0, bits=4, group_size=32):
         assert keep == 0, "keep > 0 not yet supported"
@@ -795,6 +801,7 @@ class BatchQuantizedRotatingSDPACache:
 
     def _update_decode(self, keys, values):
         """Decode path (S=1): quantize and write at the ring pointer."""
+        self._ensure_decode_capacity(keys, values)
         new_k = mx.quantize(keys, group_size=self.group_size, bits=self.bits)
         new_v = mx.quantize(values, group_size=self.group_size, bits=self.bits)
         write_pos = self._idx % self.max_size
@@ -809,6 +816,41 @@ class BatchQuantizedRotatingSDPACache:
         k_out = tuple(t[..., :n_visible, :] for t in self._keys)
         v_out = tuple(t[..., :n_visible, :] for t in self._values)
         return k_out, v_out
+
+    def _ensure_decode_capacity(self, keys, values):
+        """Grow compact merged buffers before a decode write.
+
+        ``merge()`` intentionally stores only the visible tokens.  Decode then
+        appends one token at a time, so the compact buffer must grow up to
+        ``max_size`` before writing at ``_idx``.
+        """
+        current = self._keys[0].shape[2]
+        if self._idx < current or current >= self.max_size:
+            return
+
+        B, n_kv_heads, _, k_head_dim = keys.shape
+        v_head_dim = values.shape[-1]
+        grow_by = min(self.step, self.max_size - current)
+        el_per_int = 32 // self.bits
+        shape = (B, n_kv_heads, grow_by)
+
+        def init_q(dim):
+            return (
+                mx.zeros((*shape, dim // el_per_int), dtype=mx.uint32),
+                mx.zeros((*shape, dim // self.group_size), dtype=keys.dtype),
+                mx.zeros((*shape, dim // self.group_size), dtype=keys.dtype),
+            )
+
+        extra_k = init_q(k_head_dim)
+        extra_v = init_q(v_head_dim)
+        self._keys = tuple(
+            mx.concatenate([old, extra], axis=2)
+            for old, extra in zip(self._keys, extra_k)
+        )
+        self._values = tuple(
+            mx.concatenate([old, extra], axis=2)
+            for old, extra in zip(self._values, extra_v)
+        )
 
     def _update_prefill(self, keys, values):
         """Prefill path (S>1): reorder visible tokens, append, trim, re-quantize."""
@@ -857,13 +899,37 @@ class BatchQuantizedRotatingSDPACache:
         return fp
 
     def make_mask(self, N, return_array=False, **kwargs):
-        """Causal mask with left-padding awareness."""
-        return _create_causal_mask(
-            N,
-            offset=mx.minimum(self.offset, self.max_size),
-            left_padding=self.left_padding,
-            window_size=kwargs.get("window_size"),
-        )
+        """Causal mask with left-padding awareness.
+
+        ``offset`` can track logical multimodal position progress, which may be
+        larger than the visible K/V buffer length.  Attention mask width must
+        match the cache tensors returned by ``update_and_fetch``.
+        """
+        window_size = kwargs.get("window_size") or self.max_size
+        offset = min(self.max_size - 1, self._idx)
+        rinds = mx.arange(offset + N)
+        linds = mx.arange(offset, offset + N) if offset else rinds
+        linds = linds[:, None]
+        rinds = rinds[None]
+
+        mask = linds >= rinds
+        mask &= linds < rinds + window_size
+
+        left_padding = self.left_padding
+        if (trim_size := self._idx - self.max_size + int(N > 1)) > 0:
+            left_padding = left_padding - trim_size
+
+        rotated = N == 1 and self._idx >= self.max_size
+        if rotated:
+            left_padding = left_padding - 1
+
+        mask = mask & (rinds >= mx.expand_dims(left_padding, (1, 2, 3)))
+
+        if rotated:
+            idx = self._idx % self.max_size
+            mask = mx.roll(mask, shift=idx + 1, axis=-1)
+
+        return mask
 
     def filter(self, batch_indices):
         """Keep only the given batch indices."""
