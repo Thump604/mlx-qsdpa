@@ -1,2 +1,4 @@
-from mlx_qsdpa.bench import main
+from mlx_qsdpa.benchmarks.bench import main
+
+
 main()

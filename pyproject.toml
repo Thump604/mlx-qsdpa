@@ -7,14 +7,14 @@ name = "mlx-qsdpa"
 version = "0.3.2"
 description = "Quantized SDPA decode kernel for MLX on Apple Silicon"
 requires-python = ">=3.10"
-dependencies = ["mlx>=0.21.0"]
+dependencies = ["mlx>=0.31.2"]
 
 [project.optional-dependencies]
 dev = ["pytest"]
 bench = ["mlx-lm>=0.20.0"]
 
 [tool.setuptools]
-packages = ["mlx_qsdpa"]
+packages = ["mlx_qsdpa", "mlx_qsdpa.benchmarks"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

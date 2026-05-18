@@ -33,7 +33,11 @@ cd mlx-qsdpa
 pip install -e .
 ```
 
-Requires Python >= 3.10 and mlx >= 0.21.0. No other dependencies.
+Requires Python >= 3.10 and mlx >= 0.31.2. This is the oldest MLX release
+verified by the Runtime gate for the APIs used here: `mx.fast.metal_kernel`,
+`mx.fast.scaled_dot_product_attention`, `mx.quantize`, and `mx.dequantize`.
+Do not lower this floor without adding a compatibility lane that proves the
+older MLX release still supports those APIs and passes the package tests.
 
 ## Quick Start
 
@@ -253,6 +257,9 @@ Each block computes partial attention with logsumexp stats. Pass 2 merges blocks
 logsumexp-weighted averaging. Keeps latency linear in N at 128K+.
 
 ## Benchmarks
+
+Benchmark implementations live under `mlx_qsdpa.benchmarks`; the root modules
+below remain stable compatibility entrypoints.
 
 ```bash
 # Three-way comparison: FP16 vs quantized_matmul vs fused

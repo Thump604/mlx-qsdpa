@@ -1,7 +1,39 @@
 """Shared fixtures for mlx-qsdpa tests."""
 
+from pathlib import Path
+import sys
+
 import mlx.core as mx
 import pytest
+
+
+PACKAGE_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _ensure_source_package() -> None:
+    package_root_str = str(PACKAGE_ROOT)
+    if package_root_str in sys.path:
+        sys.path.remove(package_root_str)
+    sys.path.insert(0, package_root_str)
+
+    loaded_package = sys.modules.get("mlx_qsdpa")
+    if loaded_package is None:
+        return
+
+    loaded_path = Path(getattr(loaded_package, "__file__", "")).resolve()
+    if PACKAGE_ROOT in loaded_path.parents:
+        return
+
+    for module_name in list(sys.modules):
+        if module_name == "mlx_qsdpa" or module_name.startswith("mlx_qsdpa."):
+            sys.modules.pop(module_name, None)
+
+
+_ensure_source_package()
+
+
+def pytest_runtest_setup(item):
+    _ensure_source_package()
 
 
 @pytest.fixture

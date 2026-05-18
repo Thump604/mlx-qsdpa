@@ -8,6 +8,15 @@ TOLERANCE = 1e-5  # should be exact match (same ops)
 
 
 class TestInlineQuantizedSDPA:
+    def test_compat_and_package_paths_share_reference(self):
+        """Root compatibility imports point at benchmark package implementations."""
+        from mlx_qsdpa.bench_comparison import mlx_lm_quantized_sdpa as compat_ref
+        from mlx_qsdpa.benchmarks.bench_comparison import (
+            mlx_lm_quantized_sdpa as package_ref,
+        )
+
+        assert compat_ref is package_ref
+
     def test_matches_raw_ops_non_gqa(self):
         """Inline reimplementation matches manual quantized_matmul x2 + softmax."""
         from mlx_qsdpa.bench_comparison import mlx_lm_quantized_sdpa

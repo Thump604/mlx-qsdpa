@@ -5,6 +5,98 @@ import mlx.core as mx
 from mlx_qsdpa.kernels import vector_kernel, pass1_kernel, pass2_kernel
 
 
+def _validate_quantized_sdpa_inputs(q, packed_k, packed_v, bits, group_size):
+    if q.ndim != 4:
+        raise ValueError(f"q must be 4D (B, H_q, qL, D), got ndim={q.ndim}")
+    B, H_q, qL, D = q.shape
+
+    if bits not in (4, 8):
+        raise ValueError(f"bits must be 4 or 8, got {bits}")
+    if D % 32 != 0:
+        raise ValueError(f"D must be multiple of 32, got {D}")
+
+    elems_per_int = 32 // bits
+    pack_D = D // elems_per_int
+    num_groups = D // group_size
+
+    if packed_k.ndim != 4 or packed_v.ndim != 4:
+        raise ValueError("packed_k and packed_v must be 4D (B, H_kv, N, pack_D)")
+
+    _, H_kv, N, actual_pack_D = packed_k.shape
+    if actual_pack_D != pack_D:
+        raise ValueError(
+            f"packed_k last dim {actual_pack_D} != expected pack_D={pack_D} "
+            f"for bits={bits}, D={D}"
+        )
+    if H_q % H_kv != 0:
+        raise ValueError(f"H_q ({H_q}) must be divisible by H_kv ({H_kv})")
+
+    return B, H_q, qL, D, H_kv, N, pack_D, num_groups
+
+
+def _attention_scale(scale, head_dim):
+    return head_dim ** -0.5 if scale is None else scale
+
+
+def _bias_arrays(k_scales, v_scales, k_biases, v_biases):
+    has_biases = k_biases is not None and v_biases is not None
+    if has_biases:
+        return k_biases, v_biases, has_biases
+    return mx.zeros_like(k_scales), mx.zeros_like(v_scales), has_biases
+
+
+def _fallback_sdpa(
+    q,
+    packed_k,
+    packed_v,
+    k_scales,
+    v_scales,
+    k_biases,
+    v_biases,
+    scale,
+    mask,
+    bits,
+    group_size,
+):
+    k_ref = mx.dequantize(
+        packed_k, k_scales, k_biases,
+        group_size=group_size, bits=bits,
+    )
+    v_ref = mx.dequantize(
+        packed_v, v_scales, v_biases,
+        group_size=group_size, bits=bits,
+    )
+    return mx.fast.scaled_dot_product_attention(
+        q, k_ref, v_ref, scale=scale, mask=mask
+    )
+
+
+def _decode_sdpa(
+    q,
+    packed_k,
+    packed_v,
+    k_scales,
+    v_scales,
+    k_biases,
+    v_biases,
+    dims,
+    scale,
+    bits,
+    group_size,
+    threshold,
+    has_biases,
+):
+    B, H_q, _qL, D, H_kv, N, pack_D, num_groups = dims
+    gqa_factor = H_q // H_kv
+    dispatch = _dispatch_vector if N <= threshold else _dispatch_2pass
+    return dispatch(
+        q, packed_k, packed_v,
+        k_scales, v_scales, k_biases, v_biases,
+        B, H_q, H_kv, N, D, pack_D, num_groups,
+        gqa_factor, scale, bits, group_size, has_biases,
+    )
+
+
 def quantized_sdpa(
     q,
     packed_k,
@@ -38,77 +130,23 @@ def quantized_sdpa(
     Returns:
         (B, H_q, 1, D) float16/bfloat16 attention output
     """
-    # ---- validate ----
-    if q.ndim != 4:
-        raise ValueError(f"q must be 4D (B, H_q, qL, D), got ndim={q.ndim}")
-    B, H_q, qL, D = q.shape
+    dims = _validate_quantized_sdpa_inputs(q, packed_k, packed_v, bits, group_size)
+    _B, _H_q, qL, D, _H_kv, _N, _pack_D, _num_groups = dims
+    scale = _attention_scale(scale, D)
+    k_biases, v_biases, has_biases = _bias_arrays(
+        k_scales, v_scales, k_biases, v_biases
+    )
 
-    if bits not in (4, 8):
-        raise ValueError(f"bits must be 4 or 8, got {bits}")
-    if D % 32 != 0:
-        raise ValueError(f"D must be multiple of 32, got {D}")
-
-    elems_per_int = 32 // bits
-    pack_D = D // elems_per_int
-    num_groups = D // group_size
-
-    if packed_k.ndim != 4 or packed_v.ndim != 4:
-        raise ValueError("packed_k and packed_v must be 4D (B, H_kv, N, pack_D)")
-
-    _, H_kv, N, actual_pack_D = packed_k.shape
-    if actual_pack_D != pack_D:
-        raise ValueError(
-            f"packed_k last dim {actual_pack_D} != expected pack_D={pack_D} "
-            f"for bits={bits}, D={D}"
-        )
-    if H_q % H_kv != 0:
-        raise ValueError(f"H_q ({H_q}) must be divisible by H_kv ({H_kv})")
-
-    # ---- prefill / masked fallback: dequantize + standard SDPA ----
     if qL > 1 or mask is not None:
-        k_ref = mx.dequantize(
-            packed_k, k_scales,
-            k_biases if k_biases is not None else mx.zeros_like(k_scales),
-            group_size=group_size, bits=bits,
-        )
-        v_ref = mx.dequantize(
-            packed_v, v_scales,
-            v_biases if v_biases is not None else mx.zeros_like(v_scales),
-            group_size=group_size, bits=bits,
-        )
-        if scale is None:
-            scale = D ** -0.5
-        return mx.fast.scaled_dot_product_attention(
-            q, k_ref, v_ref, scale=scale, mask=mask
+        return _fallback_sdpa(
+            q, packed_k, packed_v, k_scales, v_scales, k_biases, v_biases,
+            scale, mask, bits, group_size,
         )
 
-    # ---- decode path (qL == 1) ----
-    if scale is None:
-        scale = D ** -0.5
-
-    has_biases = k_biases is not None and v_biases is not None
-
-    # Create zero biases for symmetric quantization
-    if not has_biases:
-        k_biases = mx.zeros_like(k_scales)
-        v_biases = mx.zeros_like(v_scales)
-
-    gqa_factor = H_q // H_kv
-
-    if N <= threshold:
-        return _dispatch_vector(
-            q, packed_k, packed_v,
-            k_scales, v_scales, k_biases, v_biases,
-            B, H_q, H_kv, N, D, pack_D, num_groups,
-            gqa_factor, scale, bits, group_size, has_biases,
-        )
-    else:
-        return _dispatch_2pass(
-            q, packed_k, packed_v,
-            k_scales, v_scales, k_biases, v_biases,
-            B, H_q, H_kv, N, D, pack_D, num_groups,
-            gqa_factor, scale, bits, group_size, has_biases,
-        )
+    return _decode_sdpa(
+        q, packed_k, packed_v, k_scales, v_scales, k_biases, v_biases,
+        dims, scale, bits, group_size, threshold, has_biases,
+    )
 
 
 def _dispatch_vector(
